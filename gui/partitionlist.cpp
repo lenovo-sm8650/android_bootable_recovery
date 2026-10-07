@@ -92,18 +92,7 @@ int GUIPartitionList::Update(void)
 		return 0;
 
 	// Check for changes in mount points if the list type is mount and update the list and render if needed
-	if (ListType == "mount") {
-		int listSize = mList.size();
-		for (int i = 0; i < listSize; i++) {
-			if (PartitionManager.Is_Mounted_By_Path(mList.at(i).Mount_Point) && !mList.at(i).selected) {
-				mList.at(i).selected = 1;
-				mUpdate = 1;
-			} else if (!PartitionManager.Is_Mounted_By_Path(mList.at(i).Mount_Point) && mList.at(i).selected) {
-				mList.at(i).selected = 0;
-				mUpdate = 1;
-			}
-		}
-	}
+	// mount list: no per-frame polling (see tw_storage_changed / SetPageFocus)
 
 	GUIScrollList::Update();
 
@@ -135,6 +124,12 @@ int GUIPartitionList::NotifyVarChange(const std::string& varName, const std::str
 
 	if (!isConditionTrue())
 		return 0;
+
+	if (varName == "tw_storage_changed") { // removable storage plugged / unplugged
+		updateList = true;
+		mUpdate = 1;
+		return 0;
+	}
 
 	if (varName == mVariable && !mUpdate)
 	{

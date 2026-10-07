@@ -674,6 +674,7 @@ int GUIAction::restoredefaultsettings(std::string arg __unused)
 		DataManager::ResetDefaults();
 		PartitionManager.Update_System_Details();
 		PartitionManager.Mount_Current_Storage(true);
+		PageManager::RequestReload(); // re-apply theme variables
 	}
 	operation_end(0);
 	return 0;

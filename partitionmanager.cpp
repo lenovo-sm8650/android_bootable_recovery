@@ -595,7 +595,7 @@ void TWPartitionManager::Decrypt_Data() {
 			Set_Crypto_Type("file");
 #ifdef TW_INCLUDE_FBE_METADATA_DECRYPT
 #ifdef USE_FSCRYPT
-			if (android::vold::fscrypt_mount_metadata_encrypted(Decrypt_Data->Actual_Block_Device, Decrypt_Data->Mount_Point, false, false, Decrypt_Data->Current_File_System, TWFunc::Path_Exists(additional_fstab) ? additional_fstab : "")) {
+			if (android::vold::fscrypt_mount_metadata_encrypted(Decrypt_Data->Actual_Block_Device, Decrypt_Data->Mount_Point, false, false, Decrypt_Data->Current_File_System, "" /* zoned_device */, TWFunc::Path_Exists(additional_fstab) ? additional_fstab : "")) {
 				std::string crypto_blkdev = android::base::GetProperty("ro.crypto.fs_crypto_blkdev", "error");
 				Decrypt_Data->Decrypted_Block_Device = crypto_blkdev;
 				LOGINFO("Successfully decrypted metadata encrypted data partition with new block device: '%s'\n", crypto_blkdev.c_str());
@@ -629,22 +629,11 @@ void TWPartitionManager::Decrypt_Data() {
 				}
 			}
 		} else {
-			LOGINFO("FBE setup failed. Trying FDE...\n");
-			Set_Crypto_State();
-			Set_Crypto_Type("block");
-			int password_type = cryptfs_get_password_type();
-			if (password_type == CRYPT_TYPE_DEFAULT) {
-				LOGINFO("Device is encrypted with the default password, attempting to decrypt.\n");
-				if (Decrypt_Device("default_password") == 0) {
-					gui_msg("decrypt_success=Successfully decrypted with default password.");
-					DataManager::SetValue(TW_IS_ENCRYPTED, 0);
-				} else {
-					gui_err("unable_to_decrypt=Unable to decrypt with default password.");
-				}
-			} else {
-				DataManager::SetValue("TW_CRYPTO_TYPE", password_type);
-				DataManager::SetValue("tw_crypto_pwtype_0", password_type);
-			}
+			// Legacy FDE fallback removed; FDE was deprecated as of Android 10
+			// (see AOSP system/vold commit 0803ba0). This device is FBE-only,
+			// so a failed FBE setup has no legacy fallback path.
+			LOGERR("FBE setup failed and no legacy FDE support is available on this device.\n");
+			gui_err("unable_to_decrypt=Unable to decrypt with default password.");
 		}
 	}
 	if (Decrypt_Data && (!Decrypt_Data->Is_Encrypted || Decrypt_Data->Is_Decrypted)) {
@@ -2168,32 +2157,11 @@ int TWPartitionManager::Decrypt_Device(string Password, int user_id) {
 		return -1;
 	}
 
-	char isdecrypteddata[PROPERTY_VALUE_MAX];
-	property_get("twrp.decrypt.done", isdecrypteddata, "");
-	if (strcmp(isdecrypteddata, "true") == 0) {
-		LOGINFO("Data has no decryption required\n");
-		return 0;
-	}
-
-	int pwret = -1;
-	pid_t pid = fork();
-	if (pid < 0) {
-		LOGERR("fork failed\n");
-		return -1;
-	} else if (pid == 0) {
-		// Child process
-		char cPassword[255];
-		strcpy(cPassword, Password.c_str());
-		int ret = cryptfs_check_passwd(cPassword);
-		exit(ret);
-	} else {
-		// Parent
-		int status;
-		if (TWFunc::Wait_For_Child_Timeout(pid, &status, "Decrypt", 30))
-			pwret = -1;
-		else
-			pwret = WEXITSTATUS(status) ? -1 : 0;
-	}
+	// Legacy FDE password verification removed; FDE was deprecated as of
+	// Android 10 (see AOSP system/vold commit 0803ba0). This device is
+	// FBE-only, so this codepath is unreachable (TW_IS_FBE returns above),
+	// but is kept compiling as a safe fallback.
+	LOGERR("No legacy FDE decryption path is available on this device.\n");
 
 	// Unmount any partitions that were needed for decrypt
 	for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
@@ -2203,18 +2171,8 @@ int TWPartitionManager::Decrypt_Device(string Password, int user_id) {
 	}
 	property_set("twrp.mount_to_decrypt", "0");
 
-	if (pwret != 0) {
-		gui_err("fail_decrypt=Failed to decrypt data.");
-		return -1;
-	}
-
-	property_get("ro.crypto.fs_crypto_blkdev", crypto_blkdev, "error");
-	if (strcmp(crypto_blkdev, "error") == 0) {
-		LOGERR("Error retrieving decrypted data block device.\n");
-	} else {
-		Post_Decrypt(crypto_blkdev);
-	}
-	return 0;
+	gui_err("fail_decrypt=Failed to decrypt data.");
+	return -1;
 #else
 	gui_err("no_crypto_support=No crypto support was compiled into this build.");
 	return -1;
@@ -3347,6 +3305,50 @@ void TWPartitionManager::Remove_Uevent_Devices(const string& Mount_Point) {
 void TWPartitionManager::Handle_Uevent(const Uevent_Block_Data& uevent_data) {
 	std::vector<TWPartition*>::iterator iter;
 
+	if (!uevent_data.block_device.empty()) { // removable hotplug v2
+		string node = "/dev/block/" + uevent_data.block_device;
+		bool changed = false;
+		for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
+			TWPartition* part = *iter;
+			if (!part->Removable || !part->Sysfs_Entry.empty())
+				continue;
+			if (uevent_data.action == "add" && uevent_data.type == "partition" &&
+			    part->Primary_Block_Device == node) {
+				// ueventd creates the node from this same uevent (wait max 1 s)
+				for (int i = 0; i < 20 && !TWFunc::Path_Exists(node); i++)
+					usleep(50000);
+				LOGINFO("%s: %s was plugged in\n", part->Mount_Point.c_str(), node.c_str());
+				if (Mount_By_Path(part->Mount_Point, false)) {
+					Add_MTP_Storage(part->Mount_Point);
+					changed = true;
+				}
+			} else if (uevent_data.action == "remove" && uevent_data.type == "disk" &&
+			           part->Primary_Block_Device.compare(0, node.size(), node) == 0) {
+				LOGINFO("%s: %s was unplugged\n", part->Mount_Point.c_str(), node.c_str());
+				if (part->Is_Mounted() && !part->UnMount(false)) {
+					umount2(part->Mount_Point.c_str(), MNT_DETACH);
+					LOGINFO("%s: lazy unmounted\n", part->Mount_Point.c_str());
+				}
+				part->Size = part->Used = part->Free = part->Backup_Size = 0;
+				part->Is_Present = false;
+				if (part->Is_Storage && DataManager::GetCurrentStoragePath() == part->Storage_Path) {
+					TWPartition* def = Get_Default_Storage_Partition();
+					if (def && def != part) {
+						DataManager::SetValue("tw_storage_path", def->Storage_Path);
+						DataManager::SetBackupFolder();
+					}
+				}
+				changed = true;
+			}
+		}
+		if (changed) {
+			static int storage_serial = 0;
+			DataManager::SetValue("tw_storage_changed", ++storage_serial); // reload storage lists
+		}
+	}
+	if (uevent_data.type != "disk")
+		return;
+
 	for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
 		if (!(*iter)->Sysfs_Entry.empty()) {
 			string device;
@@ -3461,7 +3463,7 @@ void TWPartitionManager::read_uevent() {
 		i += strlen(buf+i)+1;
 	}*/
 	Uevent_Block_Data uevent_data = get_event_block_values(buf, len);
-	if (uevent_data.subsystem == "block" && uevent_data.type == "disk") {
+	if (uevent_data.subsystem == "block" && (uevent_data.type == "disk" || uevent_data.type == "partition")) {
 		PartitionManager.Handle_Uevent(uevent_data);
 	}
 }
