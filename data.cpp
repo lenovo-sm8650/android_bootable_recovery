@@ -883,7 +883,7 @@ int DataManager::GetMagicValue(const std::string& key, std::string& value) {
       const std::string cpu_temp_file = "/sys/class/thermal/thermal_zone0/temp";
 #endif
       std::string result;
-      if (!android::base::ReadFileToString(cpu_temp_file, &result)) return -1;
+      if (!android::base::ReadFileToString(cpu_temp_file, &result, /*follow_symlinks=*/true)) return -1;
       // std::from_chars partial-parses past the trailing newline sysfs appends, so
       // no Trim is needed; on garbage raw stays 0, like the old strtoul.
       uint64_t raw = 0;
